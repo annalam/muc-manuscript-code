@@ -1,0 +1,437 @@
+#!/bin/env julia
+
+using Helpers, CLI, Distributions, Variant, Printf, DelimitedFiles, Plot2, CopyNum, Random
+
+# Types of mutation evidence
+const SOMATIC_MUTATION = 1
+const HETEROZYGOUS_SNP = 2
+
+struct Evidence
+	chromosome::String
+	position::Int32
+	ref_allele::String
+	alt_allele::String
+	alt_reads::Int32
+	total_reads::Int32
+	tumor_frac::Float32
+	p_value::Float32
+	class::Int8
+end
+
+# This formula calculates values of BetaBin(x | n, α, α) even for very large
+# values of n. The BetaBinomial distribution pdf() in Distributions.jl returns
+# NaN when n > 1000. The standard formula for BetaBin(x | n, α, α) is:
+# beta(x + α, n - x + α) / ((n + 1) * beta(x + 1, n - x + 1) * beta(α, α))
+# Here we use lbeta() instead of beta() to work around issues with floating
+# point numerical precision.
+betabin_pdf(x::Integer, n::Integer, α::Real) =
+	exp(lbeta(x + α, n - x + α) - log(n + 1) - lbeta(x + 1, n - x + 1) - lbeta(α, α))
+
+betabin_cdf(x::Integer, n::Integer, α::Real) =
+	sum(k -> betabin_pdf(k, n, α), 0:x)
+
+function targeted(vcf_file::IO, sample_sheet::IO; hetz_snps="", report_dir=".", gender="", betabin_alpha=100)
+
+	report_dir = replace(expanduser(report_dir), r"/$", "")
+	d = readdlm(sample_sheet, '\t'); headers = d[1, :][:]; d = d[2:end, :];
+	tumor_normal_pairs = d[d[:, 1] .!= "", 1:2]
+	samples = tumor_normal_pairs[:, 1][:]; S = length(samples)
+	evidence = map(s -> Vector{Evidence}(), 1:S)
+
+	if gender == ""
+		x_ploidy = fill(NaN, S); y_ploidy = fill(NaN, S);
+	elseif uppercase(gender) == "XY"
+		x_ploidy = fill(1, S); y_ploidy = fill(1, S);
+	elseif uppercase(gender) == "XX"
+		x_ploidy = fill(2, S); y_ploidy = fill(0, S);
+	else
+		error("--gender parameter must be XY, XX, or empty.")
+	end
+
+	# Calculate ctDNA estimate based on somatic mutations
+	vcf = read_vcf(vcf_file)
+	@assert(length(unique(vcf.sample)) == length(vcf.sample))
+	for s in 1:S
+		test = findfirst(vcf.sample .== samples[s])
+		if test == nothing
+			error("Sample $(samples[s]) not found in VCF file.")
+		end
+		for r in 1:length(vcf.chromosome)
+			if !vcf.star[r, test]; continue; end
+
+			ploidy = 2
+			if vcf.chromosome[r][end] == 'X'
+				ploidy = x_ploidy[s]
+			elseif vcf.chromosome[r][end] == 'Y'
+				ploidy = y_ploidy[s]
+			end
+			if isnan(ploidy); continue; end
+
+			maf = vcf.alt[r, test] / vcf.total[r, test]
+
+			# TODO: Skip amplified mutations.
+
+			# The observed mutant allele fraction is drawn from a binomial
+			# distribution Bin(n, p) where p = true mutant allele fraction.
+			# Here we see what the true MAF could be, assuming that the
+			# observed MAF is a 95% quantile anomaly.
+			for p in 0:0.005:1
+				dist = Binomial(vcf.total[r, test], p)
+				if cdf(dist, vcf.alt[r, test]) < 0.95
+					maf = p; break;
+				end
+			end
+
+			tumor_frac = NaN
+			if ploidy == 1
+				tumor_frac = maf
+			elseif ploidy == 2
+				# Since we cannot detect copy number changes when cancer-%
+				# is low, we conservatively always assume LOH for autosomes.
+				tumor_frac = 2 / (1 / maf + 1)
+			end
+
+			push!(evidence[s], Evidence(vcf.chromosome[r], vcf.position[r], vcf.ref_allele[r], vcf.alt_allele[r], vcf.alt[r, test], vcf.total[r, test], tumor_frac, NaN, SOMATIC_MUTATION))
+		end
+	end
+
+	tumor_frac = zeros(S)
+	for s in 1:S
+		mutation_estimates = map(e -> e.tumor_frac, filter(e -> e.class == SOMATIC_MUTATION, evidence[s]))
+		if !isempty(mutation_estimates)
+			tumor_frac[s] = max(tumor_frac[s], maximum(mutation_estimates))
+		end
+	end
+
+	report = open("$(report_dir)/tumor_evidence.tsv", "w")
+	write(report, "CHROM\tPOSITION\tREF\tALT\tALLELE%\tTUMOR%\tTYPE\tNOTES\n")
+	evidence_types = ["Somatic mutation", "Heterozygous SNP"]
+	for s in 1:S
+		@printf(report, "\n%s (ctDNA = %.1f%%)\n", samples[s], tumor_frac[s] * 100)
+		for e in evidence[s]
+			@printf(report, "%s\t%d\t%s\t%s\t%.1f%% (%d)\t%.1f%%\t%s", e.chromosome, e.position, e.ref_allele, e.alt_allele, (e.alt_reads / e.total_reads) * 100, e.total_reads, e.tumor_frac * 100, evidence_types[e.class])
+			if e.class == HETEROZYGOUS_SNP; @printf(report, "\tp = %.3g", e.p_value); end
+			@printf(report, "\n")
+		end
+	end
+	close(report)
+
+	# Render barplot showing ctDNA fractions and somatic mutation evidence
+	# order = sortperm(-tumor_frac)
+	# dot_xy = zeros(0, 2); dot_color = zeros(UInt8, 0, 3);
+	# colors = [0 0 0; 120 120 120]
+	# for (x, s) in enumerate(order)
+	# 	somatic_af = map(e -> e.alt_reads / e.total_reads, filter(e -> e.class == SOMATIC_MUTATION, evidence[s]))
+	# 	dot_xy = vcat(dot_xy, hcat(
+	# 		x + (rand(length(somatic_af)) - 0.5) / 2, somatic_af))
+	# 	dot_color = vcat(dot_color, colors[evidence[s].mutation_protein_altering + 1, :])
+	# end
+	# figure("$(report_dir)/tumor_evidence.pdf"); g = start_plot()
+	# write(g, "set boxwidth 0.8\n")
+	# write(g, "set xrange [0.5:$(S+0.5)]\n")
+	# write(g, "set style fill solid noborder\n")
+	# write(g, "rgb(r,g,b) = int(r)*65536 + int(g)*256 + int(b)\n")
+	# bars = write_data(g, hcat(1:length(order), tumor_frac[order]))
+	# dots = write_data(g, hcat(dot_xy, dot_color))
+	# write(g, "plot $bars using 1:2 with boxes linecolor rgb '#eee', $dots using 1:2:(rgb(\$3,\$4,\$5)) with points pointtype 7 pointsize 0.5\n")
+	# end_plot()
+
+	# Print estimated ctDNA fractions
+	for s in 1:S
+		@printf("%s\t%.1f\n", samples[s], tumor_frac[s] * 100)
+	end
+end
+
+function fit_beta_binomial(hetz_snps_vcf, design_path; report_dir=".")
+	#eval(Expr(:using, :Distributions))
+	eval(Expr(:using, :Optim))
+	#eval(Expr(:using, :Plot))
+
+	report_dir = replace(expanduser(report_dir), r"/$", "")
+	d = readtsv(design_path); headers = d[1, :][:]; d = d[2:end, :];
+	tumor_normal_pairs = d[d[:, 1] .!= "", 1:2]
+	samples = tumor_normal_pairs[:, 1][:]; S = length(samples)
+
+	alt_reads = zeros(Int32, 0); total_reads = zeros(Int32, 0);
+	vcf = read_vcf(hetz_snps_vcf)
+	for s in 1:S
+		test = findone(vcf.sample .== tumor_normal_pairs[s, 1])
+		ref = findone(vcf.sample .== tumor_normal_pairs[s, 2])
+		@assert(test > 0)
+		@assert(ref > 0 || tumor_normal_pairs[s, 2] == "")
+
+		evaluable = vcf.star[:, ref] & (vcf.total[:, test] .>= 100)
+		alt_reads = vcat(alt_reads, vcf.alt[evaluable, test])
+		total_reads = vcat(total_reads, vcf.total[evaluable, test])
+	end
+
+	# Fit BetaBinom(n, a, b) to the data, with constraint a = b
+	function neglog_likelihood(params)
+		log_likelihood = 0; alpha = params[1];
+		for k in 1:length(total_reads)
+			alt = alt_reads[k]; total = total_reads[k];
+			p = betabin_pdf(alt, total, alpha)
+			#p = pdf(BetaBinomial(Int64(total), alpha, alpha), alt)
+			p = max(p, 0.00001)    # Prevent p = 0 and make robust to outliers
+			log_likelihood += log10(p)
+		end
+		info("Alpha = $(alpha). Log-likelihood = $(log_likelihood)")
+		return -log_likelihood
+	end
+	info("Data points: $(length(total_reads))")
+	max_alpha = 1000
+	res = optimize(neglog_likelihood, 1, max_alpha)
+	assert(res.minimizer < 0.95 * max_alpha)
+	println(res)
+end
+
+
+########################################################
+# ESTIMATING CTDNA FRACTION FROM COPY NUMBER LOGRATIOS #
+########################################################
+
+const CTDNA_RANGE = 0.01:0.02:0.99
+const CN_RANGE = 0:4
+const DIPLOID_LEVEL_RANGE = -1:0.05:1
+
+expected_logratio(ctdna_frac, copies) =
+	log2((ctdna_frac * copies + 2 - 2 * ctdna_frac) / 2)
+
+function nearest_level(logratio, levels)
+	nearest_dist = abs(logratio - levels[1])
+	for k in 2:length(levels)
+		dist = abs(logratio - levels[k])
+		if dist < nearest_dist
+			nearest_dist = dist
+		else
+			return k - 1
+		end
+	end
+	return length(levels)
+end
+
+# We score a model based on how close dots are to their nearest level, relative
+# to inter-level spacing.
+function model_score(logratios, levels, pairs)
+	intra_level_dist = zeros(0)
+	inter_level_dist = zeros(0)
+	for p in 1:100_000
+		a = pairs[p, 1]; b = pairs[p, 2]
+		level_a = nearest_level(a, levels)
+		level_b = nearest_level(b, levels)
+
+		push!(intra_level_dist, (a - levels[level_a])^2)
+		push!(intra_level_dist, (b - levels[level_b])^2)
+		#if level_a != level_b
+		#	push!(inter_level_dist, abs(levels[level_a] - levels[level_b]))
+		#end
+	end
+
+	# If less than 10% of the genome shows copy number changes, we
+	# abandon the solution.
+	#if length(inter_level_dist) < 10_000; return 0; end
+
+	outlier_threshold = quantile(intra_level_dist, 0.9)
+	return 1 / mean(filter(x -> x < outlier_threshold, intra_level_dist))
+	#return mean(inter_level_dist) / mean(intra_level_dist)
+
+	# for lr in logratios
+	# 	# If this logratio is outside the current range of levels, 0 points.
+	# 	level_above = findfirst(level -> lr <= level, levels)
+	# 	if level_above == nothing || level_above == 1; continue; end
+
+	# 	above = levels[level_above]
+	# 	below = levels[level_above - 1]
+	# 	relative_distance = min(above - lr, lr - below) / (above - below)
+	# 	score += 1 - relative_distance
+
+	# 	if !isfinite(score)
+	# 		@printf("Infinite score: logratio = %.3f, rel. distance = %.3f\n",
+	# 			lr, relative_distance)
+	# 	end
+	# end
+	# return score
+end
+
+function from_copy_numbers(logratios_file; output_prefix="")
+	if output_prefix == ""
+		output_prefix = replace(logratios_file, ".tsv", "")
+	end
+
+	human_autosomes = Set(@sprintf("chr%d", c) for c in 1:22)
+	d = readtsv(logratios_file)
+	sample_name = d[1, 5]
+	autosomal = [chr in human_autosomes for chr in d[2:end, 2]]
+	logratios = [parse(Float32, split(x, ':')[2]) for x in d[2:end, 5]]
+	valid = autosomal .& isfinite.(logratios)
+
+	# Only keep the autosomal regions and drop all non-finite logratios
+	chromosome = String.(d[2:end, 2][valid])
+	position = Int.(d[2:end, 3][valid])
+	logratios = logratios[valid]
+
+	expected_lr = zeros(length(CTDNA_RANGE), length(CN_RANGE))
+	for (row, ctdna_frac) in enumerate(CTDNA_RANGE)
+		for (col, copies) in enumerate(CN_RANGE)
+			expected_lr[row, col] = expected_logratio(ctdna_frac, copies)
+		end
+	end
+
+	# Generate 100 000 random data point pairs
+	pairs = zeros(100_000, 2); P = 1
+	while P <= 100_000
+		a = rand(1:length(logratios))
+		b = rand(1:length(logratios))
+		if a == b; continue; end
+		pairs[P, 1] = logratios[a]
+		pairs[P, 2] = logratios[b]
+		P += 1
+	end
+
+	# Calculate a data fit score for every model
+	model_scores = fill(NaN, length(CTDNA_RANGE), length(DIPLOID_LEVEL_RANGE))
+	for (model_idx, ctdna_frac) in enumerate(CTDNA_RANGE)
+		model_scores[model_idx, :] = [model_score(logratios, expected_lr[model_idx, :] .+ shift, pairs) for shift in DIPLOID_LEVEL_RANGE]
+	end
+
+	best_model = argmax(model_scores)
+	best_ctdna_frac = CTDNA_RANGE[best_model[1]]
+	best_diploid_level = DIPLOID_LEVEL_RANGE[best_model[2]]
+	best_levels = expected_lr[best_model[1], :]
+	best_score = model_scores[best_model]
+
+	@printf("Best model:\n")
+	@printf("ctDNA = %d%%, diploid LR = %.2f: score = %.3f\n",
+		best_ctdna_frac * 100, best_diploid_level, best_score)
+	println(best_levels .+ best_diploid_level)
+
+	fold = ceil(Int, length(position) / 5000)   # Decimate to 5000 values
+	decimated_chr = chromosome[1:fold:end]
+	decimated_pos = median_decimate(position, fold)
+	decimated_lr = median_decimate(logratios, fold)
+
+	level_colors = [RGB(0, 0, 255), RGB(120, 120, 255), RGB(0, 0, 0), RGB(255, 120, 120), RGB(255, 0, 0)]
+
+	figure("$(output_prefix).pdf", size=[12, 4]) do
+		for copies in CN_RANGE
+			line_plot([0, 1e10], fill(best_levels[copies + 1] + best_diploid_level, 2), color=level_colors[copies + 1])
+		end
+		genome_scatter_plot(decimated_chr, decimated_pos, decimated_lr)
+		ylabel("Coverage logratio"); ylim(-1.5, 1.5)
+		title(@sprintf("ctDNA = %d%%, diploid LR = %.2f, score = %.3f",
+			best_ctdna_frac * 100, best_diploid_level, best_score))
+	end
+end
+
+# function try_model(logratios_file, ctdna_frac::Float64, diploid_level::Float64)
+# 	human_autosomes = Set(@sprintf("chr%d", c) for c in 1:22)
+# 	d = readtsv(logratios_file)
+# 	sample_name = d[1, 5]
+# 	autosomal = [chr in human_autosomes for chr in d[2:end, 2]]
+# 	logratios = [parse(Float32, split(x, ':')[2]) for x in d[2:end, 5]]
+# 	valid = autosomal .& isfinite.(logratios)
+
+# 	# Only keep the autosomal regions and drop all non-finite logratios
+# 	chromosome = String.(d[2:end, 2][valid])
+# 	position = Int.(d[2:end, 3][valid])
+# 	logratios = logratios[valid]
+
+# 	# Generate 100 000 random data point pairs
+# 	Random.seed!(234852735)
+# 	pairs = zeros(100_000, 2); P = 1
+# 	while P <= 100_000
+# 		a = rand(1:length(logratios))
+# 		b = rand(1:length(logratios))
+# 		if a == b; continue; end
+# 		pairs[P, 1] = logratios[a]
+# 		pairs[P, 2] = logratios[b]
+# 		P += 1
+# 	end
+
+# 	levels = [expected_logratio(ctdna_frac, copies) for copies in CN_RANGE]
+# 	score = model_score(logratios, levels .+ diploid_level, pairs)
+
+# 	@printf("ctDNA = %d%%, diploid LR = %.2f: score = %.3f\n",
+# 		ctdna_frac * 100, diploid_level, score)
+
+# 	fold = ceil(Int, length(position) / 5000)   # Decimate to 5000 values
+# 	decimated_chr = chromosome[1:fold:end]
+# 	decimated_pos = median_decimate(position, fold)
+# 	decimated_lr = median_decimate(logratios, fold)
+
+# 	level_colors = [RGB(0, 0, 255), RGB(120, 120, 255), RGB(0, 0, 0), RGB(255, 120, 120), RGB(255, 0, 0)]
+
+# 	figure("~/$(sample_name)-$(ctdna_frac * 100)%ctDNA-$(diploid_level)level.pdf", size=[12, 4]) do
+# 		for copies in CN_RANGE
+# 			line_plot([0, 1e10], fill(levels[copies + 1] + diploid_level, 2), color=level_colors[copies + 1])
+# 		end
+# 		genome_scatter_plot(decimated_chr, decimated_pos, decimated_lr)
+# 		ylabel("Coverage logratio"); ylim(-1.5, 1.5)
+# 		title(@sprintf("ctDNA = %d%%, diploid LR = %.2f, score = %.3f",
+# 			ctdna_frac * 100, diploid_level, score))
+# 	end
+# end
+
+function try_model(logratios_file, ctdna_frac::Float64, diploid_level::Float64; output_dir="./")
+
+	chr_sizes = "~/homo_sapiens/hg38.chrom.sizes"
+	human_autosomes = Set(@sprintf("chr%d", c) for c in 1:22)
+	included_chromosomes = union(human_autosomes, ["chrX"])
+
+	d = readtsv(logratios_file)
+	sample_name = d[1, 5]
+	valid = [chr in included_chromosomes for chr in d[2:end, 1]]
+	logratios = Float32.(d[2:end, 5])
+	valid &= isfinite.(logratios)
+
+	# Only keep chromosomes 1-22,X and drop all non-finite logratios
+	chromosome = String.(d[2:end, 1][valid])
+	position = Int.(d[2:end, 2][valid])
+	logratios = logratios[valid]
+
+	# Calculate the x-axis position where the horizontal copy number lines 
+	# should end
+	d = readdlm(expanduser(chr_sizes))
+	chr22_end = sum([Int32.(d[r, 2]) for r in 1:size(d, 1) if d[r, 1] in human_autosomes])
+
+	# Generate 100 000 random data point pairs
+	Random.seed!(234852735)
+	pairs = zeros(100_000, 2); P = 1
+	while P <= 100_000
+		a = rand(1:length(logratios))
+		b = rand(1:length(logratios))
+		if a == b; continue; end
+		pairs[P, 1] = logratios[a]
+		pairs[P, 2] = logratios[b]
+		P += 1
+	end
+
+	levels = [expected_logratio(ctdna_frac, copies) for copies in CN_RANGE]
+	score = model_score(logratios, levels .+ diploid_level, pairs)
+
+	@printf("ctDNA = %d%%, diploid LR = %.2f: score = %.3f\n",
+		ctdna_frac * 100, diploid_level, score)
+
+	fold = ceil(Int, length(position) / 5000)   # Decimate to 5000 values
+	decimated_chr = chromosome[1:fold:end]
+	decimated_pos = median_decimate(position, fold)
+	decimated_lr = median_decimate(logratios, fold)
+
+	level_colors = [RGB(0, 0, 255), RGB(120, 120, 255), RGB(0, 0, 0), RGB(255, 120, 120), RGB(255, 0, 0)]
+
+	figure(@sprintf("%s/%s-%d%%ctDNA-%.2flevel.pdf", output_dir, sample_name,
+		ctdna_frac * 100, diploid_level), size=(12, 4)) do
+		for copies in CN_RANGE
+			line_plot([0, chr22_end], fill(levels[copies + 1] + diploid_level, 2), color=level_colors[copies + 1])
+		end
+		genome_scatter_plot(decimated_chr, decimated_pos, decimated_lr,
+			chr_sizes=chr_sizes)
+
+		ymin = filter(y -> levels[1] > y + 0.1, -10:0.5:-1.5)[end]
+		ylabel("Coverage logratio"); ylim(ymin, 1.5)
+		title(@sprintf("ctDNA = %d%%, diploid LR = %.2f, score = %.3f",
+			ctdna_frac * 100, diploid_level, score))
+	end
+end
+
+subcommands(targeted, fit_beta_binomial, from_copy_numbers, try_model)

@@ -1,0 +1,387 @@
+#!/bin/env julia
+
+using Helpers, CLI, CopyNum, Variant, Printf, DelimitedFiles, Statistics
+using Serialization, Loess, Plot2, KernelDensity
+
+function write_igv(path::String, samples::Array, chromosome::Array, position::Array, values::Array)
+	out = open(expanduser(path), "w")
+	write(out, "CHROM\tSTART\tEND\tFEATURE\t$(join(samples, '\t'))\n")
+	for k in 1:length(chromosome)
+		write(out, "$(chromosome[k])\t$(position[k])\t$(position[k]+1)\t")
+		for v in values[k, :]; @printf(out, "\t%.2f", v); end
+		write(out, '\n')
+	end
+	close(out)
+end
+
+function call_targeted(bed_path, design_path; hetz_snps="", gc_fractions="", max_noise=0.2, min_snp_depth=100, report_dir="./", controls="", style="", output_format="TSV", plot_gc_bias=false)
+
+	@assert(style in ["", "violin", "dot"])
+	@assert(report_dir != "")
+	report_dir = expanduser(report_dir)
+	hetz_snps = expanduser(hetz_snps)
+
+	info("Reading target coordinates into memory...")
+	d = readdlm(bed_path, '\t');
+	chromosome = d[:, 1]; position = Int.(d[:, 2:3]);
+	position = round.(Int, mean(position, dims=2)); gene = d[:, 4]
+	gc_frac = Float64.(readdlm(gc_fractions, '\t')[:, 3])
+	@assert(all(isfinite, gc_frac))
+	info("Found $(length(position)) total capture regions.")
+
+	if isempty(controls)
+		error("Please provide a list of control samples with the --controls parameter.")
+	end
+	controls = readdlm(controls, '\t')[:, 1]
+	info("Constructing a median reference based on $(length(controls)) control samples...")
+	ref = zeros(length(position), length(controls))
+	for s in 1:length(controls)
+		ref[:, s] = readdlm("$(controls[s]).tsv", '\t')
+	end
+	ref = max.(ref, 1)    # Prevent issues with logarithm
+
+	cov_ok = (median(ref, dims=2) .>= 50)[:]
+	chromosome = chromosome[cov_ok]; position = position[cov_ok]
+	gene = gene[cov_ok]; gc_frac = gc_frac[cov_ok]
+	ref = ref[cov_ok, :]
+	info("Discarded $(sum(cov_ok .== false)) regions due to low median coverage.")
+
+	@assert(all(isfinite, ref[:, 1]))
+	for col in 2:length(controls)
+		# Correct GC bias relative to reference sample #1
+		# TODO: Consider a better approach than relying on sample #1
+		lr = log2.(ref[:, col] ./ ref[:, 1])
+		@assert(all(isfinite, lr))
+		model = loess(gc_frac, lr)
+		lr -= predict(model, gc_frac)
+		@assert(all(isfinite, lr))
+		ref[:, col] = ref[:, 1] .* 2 .^ lr
+	end
+	if !all(isfinite, ref)
+		error("Reference coverage matrix of size $(size(ref)) contains $(sum(isnan, ref)) NaN values and $(sum(ref .== Inf)) Inf values.")
+	end
+	#@assert(all(isfinite.(ref)))
+	median_ref = median(ref, dims=2)[:]
+
+	# Drop baits that are noisy even in control samples after GC correction
+	noise = [median(abs.(log2.(ref[r, :] ./ median_ref[r])))
+		for r in 1:size(ref, 1)]
+	#grid = 0:0.01:1.5; density = kde(noise, grid).density;
+	#figure("$(report_dir)/bait_noise_histogram.pdf"); area_plot(grid, density)
+	noise_ok = (noise .<= max_noise)
+	chromosome = chromosome[noise_ok]; position = position[noise_ok];
+	gene = gene[noise_ok]; gc_frac = gc_frac[noise_ok];
+	median_ref = median_ref[noise_ok]
+	info("Discarded $(sum(noise_ok .== false)) regions due to high noise level.")
+
+	# Build a boolean vector of good regions
+	good_regions = cov_ok
+	good_regions[cov_ok] = noise_ok
+
+	# Read sample sheet into memory
+	d = readdlm(design_path, '\t', String); headers = d[1, :][:]
+	@assert(headers[1:2] == ["TEST", "REF"])
+	d = d[d[:, 1] .!= "", :]
+	samples = d[2:end, 1]
+	matched_germline = d[2:end, 2]
+	
+	info("Calculating coverage logratios...")
+	logratio = zeros(length(position), length(samples))
+	for s in 1:length(samples)
+		test = readdlm("$(samples[s]).tsv", '\t')[good_regions, 1]
+		test = max.(test, 1)    # Prevent issues with logarithm
+		lr = log2.(test ./ median_ref)
+
+		# Do Loess fit, drop outliers 2.0 logratios away, then redo fit
+		model = loess(gc_frac, lr)
+		outlier = abs.(lr - predict(model, gc_frac)) .> 2.0
+		outlier[argmin(gc_frac)] = false    # Avoid extrapolation
+		outlier[argmax(gc_frac)] = false    # Avoid extrapolation
+		model = loess(gc_frac[.!outlier], lr[.!outlier])
+
+		if plot_gc_bias
+			figure("$(report_dir)/$(samples[s])_gc_bias.pdf", size=(4, 3)) do
+				scatter_plot(gc_frac, lr, size=5, color=RGB(180))
+				x = minimum(gc_frac):0.01:maximum(gc_frac)
+				line_plot(x, predict(model, x), color=RGB(255, 0, 0))
+				xlim(0.2, 0.8); xlabel("GC fraction")
+				ylabel("Logratio relative to reference")
+			end
+		end
+
+		lr .-= predict(model, gc_frac)
+		lr .-= median(filter(isfinite, lr))
+		logratio[:, s] = lr
+	end
+	@assert(all(isfinite.(logratio)))
+
+	# DEBUG
+	#s = findone(samples, "CALGB-7T_1-FFPE-UMI")
+	#for r in 1:length(gene)
+	#	if gene[r] != "MSH2"; continue; end
+	#	if logratio[r, s] > -1; continue; end
+	#	@printf(stderr, "MSH2 deleted at position %d.", position[r])
+	#end
+
+	# Prepare the CopyNumber data structure
+	cn = CopyNumber(unique(gene[gene .!= ""]), samples);
+	for g in 1:length(cn.gene)
+		baits = (cn.gene[g] .== gene)
+		cn.num_probes[g] = sum(baits)
+		cn.logratio[g, :] = median(logratio[baits, :], dims=1)
+		cn.chromosome[g] = chromosome[findfirst(x -> cn.gene[g] == x, gene)]
+		cn.position[g, 1] = minimum(position[gene .== cn.gene[g]])
+		cn.position[g, 2] = maximum(position[gene .== cn.gene[g]])
+	end
+	cn = cn[cn.num_probes .>= 2, :]   # Discard genes with < 2 probes
+
+	# Calculate sample noise levels
+	for s in 1:length(samples)
+		diffs = zeros(0)
+		for g in 1:length(cn.gene)
+			baits = (cn.gene[g] .== gene)
+			append!(diffs, diff(logratio[baits, s]))
+		end
+		cn.sample_noise[s] = median(abs.(diffs))
+	end
+
+	info("Reading heterozygous SNP allele fractions...")
+	hetz_af = map(x -> zeros(0), zeros(length(cn.gene), length(samples)))
+	if hetz_snps != ""
+		vcf = read_minimal_vcf(hetz_snps)
+		for s in 1:length(samples)
+			tumor = findone(vcf.sample, samples[s])
+			wbc = findone(vcf.sample, matched_germline[s])
+			if tumor == nothing || wbc == nothing; continue; end
+			for g in 1:length(cn.gene)
+				valid = [vcf.star[r, wbc] && vcf.total[r, tumor] >= min_snp_depth && vcf.chromosome[r] == cn.chromosome[g] && cn.position[g, 1] - 100 <= vcf.position[r] <= cn.position[g, 2] + 100 for r in 1:size(vcf, 1)]
+				af = vcf.alt[valid, tumor] ./ vcf.total[valid, tumor] .* 100
+				append!(hetz_af[g, s], 50 .+ abs.(af .- 50))
+			end
+		end
+	end
+
+	info("Finalizing copy number calls...")
+	for s in 1:length(cn.sample)
+		for g in 1:length(cn.gene)
+			call = 0; lr = cn.logratio[g, s]; maf = cn.median_af[g, s]
+			if lr <= -0.15 && maf >= 0.6; call = -1; end
+			if lr <= -0.3; call = -1; end
+			if lr <= -1.0; call = -2; end
+			if lr >= 0.15 && maf >= 0.6; call = 1; end
+			if lr >= 0.3; call = 1; end
+			if lr >= 0.7; call = 2; end
+			cn.call[g, s] = call
+		end
+	end
+	if output_format == "TSV"
+		writetsv(stdout, cn)
+		noise_file = open("$(report_dir)/sample_noise.tsv", "w")
+		for s in 1:length(samples)
+			@printf(noise_file, "%s\t%.3f\n", samples[s], cn.sample_noise[s])
+		end
+		close(noise_file)
+	elseif output_format == "JLS"
+		serialize(stdout, cn)
+		#open(stdout, "w") do f
+		#	serialize(f, cn)
+		#end
+	end
+
+	cna_colors = [RGB(0,0,255), RGB(120,120,255), RGB(0,0,0), RGB(255,120,120), RGB(255,0,0)]
+	info("Rendering coverage logratio violin plots...")
+	grid = -10:0.05:10
+	for s in 1:length(samples)
+		density = zeros(length(grid), length(cn.gene))
+		for g in 1:length(cn.gene)
+			lr = filter(isfinite, logratio[gene .== cn.gene[g], s])
+			density[:, g] = kde(lr, grid).density
+		end
+		#labels = map(g -> "$(cn.num_probes[g])  $(cn.gene[g])", enough_probes)
+
+		ymin = floor(min(-3, minimum(cn.logratio[:, s])))
+		ymax = ceil(max(3, maximum(cn.logratio[:, s])))
+		figure("$(report_dir)/$(samples[s]).pdf",
+			size=(length(cn.gene) * 0.15, 8)) do
+			subplot(1, 2)
+			violin_plot(grid, density,
+				colors=cna_colors[cn.call[:, s] .+ 3])
+			xticks(cn.gene); yticks(ymin:ymax); ylim(ymin, ymax)
+			ylabel("Coverage logratio")
+
+			subplot(2, 2)
+			beeswarm_plot(hetz_af[:, s]...)
+			xlim(0.25, length(cn.gene) + 0.75); ylim(50, 100)
+			xticks(cn.gene); ylabel("SNP allele fraction")
+		end
+	end
+end
+
+
+function call_genomewide(grid_bed::IO, sample_sheet::IO; hetz_snps="", gc_fractions="", report_dir="", yrange=2, igv_track=false, plot_gc_bias=false, snp_median_decimate=1, logratio_dots=4000)
+
+	report_dir = expanduser(report_dir)
+	hetz_snps = expanduser(hetz_snps)
+
+	info("Reading sample sheet...")
+	d = readdlm(sample_sheet, '\t')
+	@assert(d[1, 1] == "TEST" && d[1, 2] == "REF");
+	ref_samples = filter(s -> s != "", unique(d[2:end, 2]))
+	sample_sheet = d[2:end, :]
+
+	info("Reading grid into memory...")
+	d = readdlm(grid_bed)
+	chromosome = String.(d[:, 1])
+	position = Int.(d[:, 2:3])
+	position = round.(Int, mean(position, dims=2))
+	d = readdlm(gc_fractions, '\t'); gc_frac = Float64.(d[:, 3]);
+
+	info("Reading coverage data for $(length(ref_samples)) control samples...")
+	ref_coverage = zeros(length(position), length(ref_samples))
+	for (s, ref_sample) in enumerate(ref_samples)
+		ref_coverage[:, s] = readdlm("$(ref_sample).tsv")
+	end
+	ref_coverage = max.(ref_coverage, 1)    # Avoid -Inf logratios
+
+	# Discard regions with low coverage
+	cov_ok = median(ref_coverage, dims=2)[:] .>= 50
+	ref_coverage = ref_coverage[cov_ok, :]
+	gc_frac = gc_frac[cov_ok]
+	chromosome = chromosome[cov_ok]
+	position = position[cov_ok]
+	@printf(stderr, "Discarded %d / %d (%.1f%%) regions due to low median coverage.\n", sum(cov_ok .== false), length(cov_ok), mean(!cov_ok) * 100)
+
+	# Subsample to 5000 values per sample to make Loess run in reasonable time
+	gc_order = sortperm(gc_frac)
+	stride = ceil(Int, length(gc_frac) / 5000)
+	gc_order = vcat(gc_order[1:stride:end], gc_order[end])
+
+	# Calculate median reference based on normal samples
+	info("Constructing a median reference...")
+	for s in 2:size(ref_coverage, 2)
+		lr = log2.(ref_coverage[:, s] ./ ref_coverage[:, 1])
+		model = loess(gc_frac[gc_order], lr[gc_order])
+		lr -= predict(model, gc_frac)
+		ref_coverage[:, s] = ref_coverage[:, 1] .* 2 .^ lr
+	end
+	median_ref = median(ref_coverage, dims=2)[:]
+	if !all(isfinite, median_ref)
+		error("Median reference contains non-finite values.")
+	end
+
+	# Discard the most noisy 10% of regions
+	info("Discarding the top 10% of regions with highest noise level...")
+	region_noise = [median(abs.(log2.(ref_coverage[k, :] ./ median_ref[k])))
+		for k in 1:length(median_ref)]
+	noise_ok = region_noise .<= quantile(region_noise, 0.9)
+	median_ref = median_ref[noise_ok]
+	gc_frac = gc_frac[noise_ok]
+	chromosome = chromosome[noise_ok]
+	position = position[noise_ok]
+
+	# Create "all_ok" vector specifying which regions are included in analysis.
+	all_ok = cov_ok[:]
+	all_ok[cov_ok] .= noise_ok
+
+	# Release some memory
+	ref_coverage = []
+
+	# Recalculate the "gc_order" vector after removal of high noise regions
+	gc_order = sortperm(gc_frac)
+	stride = ceil(Int, length(gc_frac) / 5000)
+	gc_order = vcat(gc_order[1:stride:end], gc_order[end])
+
+	# Decimate logratios to a user-defined number of points (default 4000)
+	fold = ceil(Int, length(median_ref) / logratio_dots)
+	info("Logratios are median-decimated $(fold)-fold for visualization.")
+
+	info("Reading heterozygous SNP allele fractions into memory...")
+	vcf = hetz_snps != "" ? read_minimal_vcf(hetz_snps) : MinimalVCF()
+
+	for r in 1:size(sample_sheet, 1)
+		tumor = sample_sheet[r, 1]
+		paired_ref = sample_sheet[r, 2]
+		if tumor == ""; continue; end
+		if !isfile("$(tumor).tsv")
+			info("WARNING: Missing tumor sample $(tumor) skipped.")
+			continue
+		end
+
+		info("Processing sample $(tumor)...")
+		coverage = Float32.(readdlm("$(tumor).tsv"))[all_ok, 1]
+		coverage = max.(coverage, 1)   # Avoid -Inf logratios
+
+		has_snp_track = (hetz_snps != "") && (paired_ref != "")
+		if has_snp_track && !(tumor in vcf.sample)
+			info("WARNING: Sample $(tumor) is missing from SNP VCF file.")
+			has_snp_track = false
+		end
+		if has_snp_track && !(paired_ref in vcf.sample)
+			info("WARNING: Sample $(paired_ref) is missing from SNP VCF file.")
+			has_snp_track = false
+		end
+
+		# Coverage logratio track
+		lr = log2.(coverage ./ median_ref)
+		orig_lr = copy(lr)
+		@assert(!any(isnan, lr))
+		model = loess(gc_frac[gc_order], lr[gc_order])
+		lr .-= predict(model, gc_frac)
+		if count(isnan, lr) >= length(lr) / 10
+			info("WARNING: Sample $(tumor) skipped because more than 10% of logratios were NaN.")
+			out = open("$(report_dir)/$(tumor)_gc_bias.txt", "w")
+			for k in gc_order
+				@printf(out, "%.3f\t%.3f\n", gc_frac[k], orig_lr[k])
+			end
+			close(out)
+			figure("$(report_dir)/$(tumor)_gc_bias.pdf") do
+				scatter_plot(gc_frac[gc_order], orig_lr[gc_order])
+				line_plot(gc_frac[gc_order], predict(model, gc_frac[gc_order]))
+			end
+			continue
+		end
+
+		# Normalize coverage logratios so that median logratio is zero.
+		lr .-= median(filter(isfinite, lr))
+
+		#@info(hcat(coverage[1:10, s], ref_coverage[1:10], lr[1:10]))
+
+		# TODO: Account for chromosome boundaries in decimation
+		decimated_chr = chromosome[1:fold:end]
+		decimated_pos = median_decimate(position, fold)
+		decimated_lr = median_decimate(lr, fold)
+
+		if igv_track
+			write_igv("$(report_dir)/$(tumor)_logratio.igv", [tumor],
+				chromosome, position, lr)
+		end
+
+		total_panels = 1 + has_snp_track
+		figure("$(report_dir)/$(tumor).pdf", size=[12, 6]) do
+			subplot(1, 2)
+			genome_scatter_plot(decimated_chr, decimated_pos, decimated_lr)
+			ylabel("Coverage logratio"); ylim(-yrange, yrange);
+
+			# Heterozygous SNP allele fraction track (if applicable)
+			if has_snp_track
+				test = findone(vcf.sample, tumor)
+				ref = findone(vcf.sample, paired_ref)
+				hetz = vcf.star[:, ref] .& (vcf.total[:, test] .>= 50)
+				allele_fracs = vcf.alt[:, test] ./ vcf.total[:, test]
+
+				decimated_chr = vcf.chromosome[hetz][1:snp_median_decimate:end]
+				decimated_pos = vcf.position[hetz][1:snp_median_decimate:end]
+				decimated_divergence = median_decimate(abs.(allele_fracs[hetz] .- 0.5) .+ 0.5, snp_median_decimate)
+
+				subplot(2, 2)
+				genome_scatter_plot(decimated_chr, decimated_pos, decimated_divergence)
+				ylabel("Allele fraction"); ylim(0.5, 1);
+				if igv_track
+					write_igv("$(report_dir)/$(tumor)_hetz_snp.igv", [tumor], vcf.chromosome[hetz], vcf.position[hetz], allele_fracs)
+				end
+			end
+		end
+	end
+end
+
+subcommands(call_targeted, call_genomewide)

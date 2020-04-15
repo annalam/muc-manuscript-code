@@ -1,0 +1,20 @@
+#!/bin/env julia
+
+using CLI, Printf
+
+function grid(genome_path::IO, win_size::Int; step=0)
+	if step == 0; step = round(Int, win_size / 2); end
+	for line in eachline(genome_path)
+		c = split(line, '\t')
+		if length(c) < 2; continue; end
+		chr = c[1]
+		chr_len = parse(Int, c[2])
+		start = 1
+		while start + win_size < chr_len
+			println("$(chr)\t$(start-1)\t$(start + win_size - 1)")
+			start += step
+		end
+	end
+end
+
+subcommands(grid)

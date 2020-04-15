@@ -1,0 +1,10 @@
+[package]
+name = "mutato"
+version = "0.1.0"
+authors = ["Matti Annala <matti.annala@uta.fi>"]
+
+[dependencies]
+docopt = "*"
+bio = "0.29.0"
+rust-htslib = "0.15.0"
+lazy_static = "*"

@@ -1,0 +1,135 @@
+#!/bin/env julia
+
+using CLI, Helpers, Printf, FastaIO
+
+function rename(sample_sheet::IO)
+	d = readtsv(sample_sheet, text=true)
+	if size(d, 2) < 2
+		error("Sample sheet must have two columns: sample name and barcode.")
+	end
+	valid = [strip(d[r, 1]) != "" && strip(d[r, 2]) != ""
+		for r in 1:size(d, 1)]
+	d = d[valid, :]
+
+	quit = false
+	for r in 1:size(d, 1)
+		if d[r, 1] == ""
+			info("Missing sample name for barcode $(d[r, 2]).")
+		elseif d[r, 2] == ""
+			info("Missing barcode for sample $(d[r, 1]).")
+		elseif sum(d[:, 1] .== d[r, 1]) > 1 && !any(d[1:r-1, 1] .== d[r, 1])
+			info("Sample $(d[r, 1]) is found twice in sample sheet.")
+			quit = true
+		elseif sum(d[:, 2] .== d[r, 2]) > 1 && !any(d[1:r-1, 2] .== d[r, 2])
+			info("Barcode $(d[r, 2]) is found twice in sample sheet.")
+			quit = true
+		end
+	end
+	if quit; error("Stopping due to sample sheet abnormalities."); end
+
+	sheet = Dict(d[k, 2] => d[k, 1] for k in 1:size(d, 1))
+	files = readdir()
+	matches = [match(r"_1_([ACGT]+)_.*.(fastq|fq).gz", f) for f in files]
+	barcodes = [m.captures[1] for m in matches if m != nothing]
+	for barcode in barcodes
+		if !(barcode in keys(sheet))
+			info("Sample barcode $barcode not found in sample sheet.")
+			quit = true
+		end
+	end
+
+	for barcode in keys(sheet)
+		if !(barcode in barcodes)
+			info("Barcode $barcode is not found in directory, but is present in sample sheet.")
+		end
+	end
+
+	for barcode in barcodes
+		new_name = get(sheet, barcode, "")
+		if new_name == ""; continue; end
+		old_name_1 = only(f -> "_1_$(barcode)_" in f, files)
+		old_name_2 = only(f -> "_2_$(barcode)_" in f, files)
+		println("Renaming $(old_name_1) -> $(new_name)_1.fq.gz")
+		println("Renaming $(old_name_2) -> $(new_name)_2.fq.gz")
+		mv(old_name_1, "$(new_name)_1.fq.gz")
+		mv(old_name_2, "$(new_name)_2.fq.gz")
+	end
+end
+
+"""
+Calculate GC content in regions defined by BED file.
+"""
+function gc_content(fasta_file::IO, bed_file::IO)
+	fasta = Dict{String, String}(readfasta(fasta_file))
+	for line in eachline(bed_file)
+		cols = split(line, '\t')
+		chr = cols[1]
+		start = parse(Int, cols[2]) + 1
+		stop = parse(Int, cols[3])
+		seq = uppercase(fasta[cols[1]][start:stop])
+		gc = sum(base -> base == 'C' || base == 'G', seq)
+		@printf("%d\t%d\t%.3f\n", gc, length(seq), gc / length(seq))
+	end
+end
+
+struct Alignment
+	seq::String
+	root_pos::Int
+end
+
+function reads_around_root(root_seq, fasta_paths...)
+	root_seq = uppercase(root_seq)
+	alignments = Array{Alignment}(0)
+	for fasta_path in fasta_paths
+		fasta_file = zopen(fasta_path)
+		while !eof(fasta_file)
+			line = readline(fasta_file)
+			if isempty(line); continue; end
+			if line[1] == '+' || line[1] == '>' || line[1] == '@'; continue;end
+			seq = line
+			if !isupper(seq); seq = uppercase(seq); end
+			pos = searchindex(seq, root_seq)
+			if pos > 0
+				push!(alignments, Alignment(seq, pos))
+				continue
+			end
+			rseq = revcomplement(seq)
+			pos = searchindex(rseq, root_seq)
+			if pos > 0
+				push!(alignments, Alignment(rseq, pos))
+				continue
+			end
+		end
+		close(fasta_file)
+	end
+	if length(alignments) == 0; return; end
+
+	sort!(alignments, by=(a -> -a.root_pos))
+	left_pad = alignments[1].root_pos
+	for al in alignments
+		println(" "^(left_pad - al.root_pos), al.seq)
+	end
+end
+
+function sample_index(fasta_path)
+	fasta_file = zopen(fasta_path)
+	candidates = Array{String}(0)
+	while !eof(fasta_file) && length(candidates) < 100
+		line = readline(fasta_file)
+		if line[1] == '@'
+			push!(candidates, line[rsearch(line, ':')+1:end-1])
+			readline(fasta_file)
+			readline(fasta_file)
+			readline(fasta_file)
+		else
+			error("Invalid format.")
+		end
+	end
+	close(fasta_file)
+
+	best = sort(unique(candidates), by=(c -> sum(candidates .== c)), rev=true)[1]
+	println("$(best)\t$(sum(candidates .== best)) / 100")
+end
+
+subcommands(rename, gc_content, reads_around_root, sample_index)
+
