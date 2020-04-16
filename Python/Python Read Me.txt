@@ -26,9 +26,10 @@ math:N/A
 Underlying mutation and copy number data to create the figures was formatted using the following 2 Python definitions:
 
 '''
-Input: Output of Julia code listing all copy number results for all genes and samples
-Output: Pandas Dataframe (then saved as CN_melted.xlsx)
-Function: Produce a dataframe where each row is a single gene for a single sample from a matrix of all samples and genes. Include copy neutral genes (copy number == 0)
+Input: Path of gene_cna.tsv, product of copynum call targeted
+Output: Pandas Dataframe (then saved as CN_melted.xlsx). Includes Gene, chromosome, start and end of the region in genomic coordinates, log-ratio,
+and copy number call based on custom thresholds
+Function: Produce a dataframe where each row is a single geneool for a single sample from a matrix of all samples and genes. Include copy neutral genes (copy number == 0)
 in final table.
 '''
 
@@ -45,28 +46,29 @@ def meltCN(filepath):
 
 
 '''
-Input: Betastatsis table from output of mutato program
-Output: Pandas dataframe (then saved as mut_melted.xslx)
-Function: Produce a dataframe in which each row is a mutation for a single sample. Do not include rows where a mutation was not detected. 
+Input: Path of somatic.vcf, product of Mutato mutation analysis
+Output: Pandas dataframe (then saved as mut_melted.xslx). Includes chomosome, genomic position, reference nucleotide, alternate nucleotide, gene mutated,
+		type of mutation (EFFECT), and addition information in NOTES (COSMIC score for example)
+Function: Produce a dataframe in which each row is a somatic mutation present a sample. Do not include rows where a mutation was not detected.
 '''
 
-def meltBet(path):
-    df = pd.read_excel(path, index_col=None)
-    df = pd.melt(df, id_vars=['CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'NOTES'])
-    df.rename(columns={'value': 'Allele_frequency'}, inplace=True)
-    df.rename(columns={'variable': 'Sample_ID'}, inplace=True)
-    df['Read_depth'] = df['Allele_frequency'].str.split(pat='%', n=-1, expand=False).str[1]
-    df = df[df['Read_depth'].str.contains("*", regex=False)]
-    df['Read_depth'] = df['Read_depth'].replace('\(','', regex=True)
-    df['Read_depth'] = df['Read_depth'].replace('\)','', regex=True)
-    df['Read_depth'] = df['Read_depth'].replace('\*','', regex=True)
-    df['Read_depth'] = df['Read_depth'].replace('\*','', regex=True)
-    df['Read_depth'] = df['Read_depth'].replace("\[[^]]*\]",'', regex=True)
-    df['Allele_frequency'] = df['Allele_frequency'].str.split(pat='%', n=-1, expand=False).str[0]
-    df = df[['Sample_ID', 'CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'Allele_frequency', 'Read_depth','NOTES']]
-    df[['Read_depth','Allele_frequency']] = df[['Read_depth','Allele_frequency']].apply(pd.to_numeric)
-    return df;
 
+def meltBet(path):
+    data_xls = pd.read_excel(path, index_col=None)
+
+	data_xls = pd.melt(data_xls, id_vars=['CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'NOTES'])
+	data_xls.rename(columns={'value': 'Allele_frequency'}, inplace=True)
+	data_xls.rename(columns={'variable': 'Patient_ID'}, inplace=True)
+
+	data_xls = data_xls[data_xls['Allele_frequency'].str.contains("*", regex=False)]
+
+	data_xls['Read_depth'] = data_xls['Allele_frequency'].str.split(':').str[1]
+	data_xls['Read_depth'] = data_xls['Read_depth'].apply(pd.to_numeric)
+	data_xls['Allele_frequency'] = pd.to_numeric(data_xls['Allele_frequency'].str.split(':').str[0]) / data_xls['Read_depth'] * 100
+	data_xls[['Read_depth','Allele_frequency']] = data_xls[['Read_depth','Allele_frequency']].apply(pd.to_numeric)
+
+	data_xls = data_xls[['Patient_ID', 'CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'Allele_frequency', 'Read_depth','NOTES']]
+	return data_xls;
 
 
 Other recurrent Python code:
