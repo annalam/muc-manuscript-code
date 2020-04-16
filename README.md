@@ -42,51 +42,7 @@ Python packages used:
 - lifelines (version 0.22.3)
 - argparse (version 1.1)
 
-Underlying mutation and copy number data to create the figures was formatted using the following two Python definitions:
-
-	'''
-	Input: Path of gene_cna.tsv, product of copynum call targeted
-	Output: Pandas Dataframe (then saved as CN_melted.xlsx). Includes Gene, chromosome, start and end of the region in genomic coordinates, log-ratio,
-	and copy number call based on custom thresholds
-	Function: Produce a dataframe where each row is a single geneool for a single sample from a matrix of all samples and genes. Include copy neutral genes (copy number == 0)
-	in final table.
-	'''
-
-	def meltCN(filepath):
-	    df = pd.read_csv(filepath, delimiter = '\t', index_col=None)
-	    df = pd.melt(df, id_vars=['GENE', 'CHROMOSOME', 'START', 'END'])
-	    df.rename(columns={'value': 'Copy_num'}, inplace=True)
-	    df.rename(columns={'variable': 'Sample_ID'}, inplace=True)
-	    df['Log_ratio'] = df['Copy_num'].str.split(':').str[1]
-	    df['Copy_num'] = df['Copy_num'].str.split(':').str[0]
-	    df[['Copy_num','Log_ratio']] = df[['Copy_num','Log_ratio']].apply(pd.to_numeric)
-	    df = df[['Sample_ID', 'GENE', 'Copy_num', 'Log_ratio', 'CHROMOSOME', 'START', 'END']]
-	    return df;
-
-
-	'''
-	Input: Path of somatic.vcf, product of Mutato mutation analysis
-	Output: Pandas dataframe (then saved as mut_melted.xslx). Includes chomosome, genomic position, reference nucleotide, alternate nucleotide, gene mutated,
-			type of mutation (EFFECT), and addition information in NOTES (COSMIC score for example)
-	Function: Produce a dataframe in which each row is a somatic mutation present a sample. Do not include rows where a mutation was not detected.
-	'''
-
-
-	def meltBet(path):
-	    data_xls = pd.read_excel(path, index_col=None)
-	    data_xls = pd.melt(data_xls, id_vars=['CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'NOTES'])
-	    data_xls.rename(columns={'value': 'Allele_frequency'}, inplace=True)
-	    data_xls.rename(columns={'variable': 'Patient_ID'}, inplace=True)
-	    data_xls = data_xls[data_xls['Allele_frequency'].str.contains("*", regex=False)]
-	    data_xls['Read_depth'] = data_xls['Allele_frequency'].str.split(':').str[1]
-	    data_xls['Read_depth'] = data_xls['Read_depth'].apply(pd.to_numeric)
-	    data_xls['Allele_frequency'] = pd.to_numeric(data_xls['Allele_frequency'].str.split(':').str[0]) / data_xls['Read_depth'] * 100
-	    data_xls[['Read_depth','Allele_frequency']] = data_xls[['Read_depth','Allele_frequency']].apply(pd.to_numeric)
-	    data_xls = data_xls[['Patient_ID', 'CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'Allele_frequency', 'Read_depth','NOTES']]
-	    return data_xls
-
-
-Other recurrent Python code:
+The following Python code was used for determining whether a mutation was protein altering:
 
 	'''
 	Input: Melted mutation Pandas dataframe
