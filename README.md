@@ -44,12 +44,6 @@ Python packages used:
 
 The following Python code was used for determining whether a mutation was protein altering:
 
-	'''
-	Input: Melted mutation Pandas dataframe
-	Output: Melted mutation Pandas dataframe with only coding mutations
-	Function: Eliminate non-protien-coding mutations from the mutation matrix. 
-	'''
-
 	def keepCodingMutations(df_muts):
 	    return df_muts[(df_muts['EFFECT'].str.contains("Missense", regex=False)) |
 		(df_muts['EFFECT'].str.contains("Stopgain", regex=False)) |
