@@ -1,7 +1,7 @@
 Python ReadMe
 
 All figures were generated in Python 3.7.3 using the packages and libraries listed below. All statistics were performed with the scipy.stats package, except for 
-Cox Proportional-Hazard Models, which were performed with lifelines. An example Kaplan Meier script is availiable. 
+Cox Proportional-Hazard Models, which were performed with lifelines.
 
 Our Anaconda environment can be recreated by running the following for each package:
 conda install PACKAGE=VERSION
