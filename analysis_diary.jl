@@ -1,4 +1,22 @@
 
+
+# ALIGN READS USING BOWTIE2, PERFORMING DUPLICATE MARKING OF ALIGNED READS
+# USING SAMBLASTER
+echo *_1.fq.gz | parallel -n1 'fasta interleave <(fasta simplify read ids $x) <(fasta simplify read ids ${x/_1.fq/_2.fq}) | cutadapt --interleaved -f fastq -m 20 -a AGATCGGAAGAGC -A AGATCGGAAGAGC - | fasta trim by quality - 30 | fasta mask by quality - 20 | bowtie2 -p20 -X 1000 --score-min L,0,-0.6 --ignore-quals --sam-no-qname-trunc -x ~/tools/bowtie2-indexes/homo_sapiens/hg38 --interleaved - | samblaster | samtools view -u - | sam minimize --base-qualities --tags --uncompressed - | sam tags from qname --uncompressed - | samtools sort -m 4G -o ../alignments/${x/_1.fq.gz/.bam}'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ALIGNMENT STATISTICS
 cd ~/datasets/bladder_cfdna/panel_v1/alignments
 mkdir ../statistics
