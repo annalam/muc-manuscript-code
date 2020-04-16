@@ -74,20 +74,16 @@ Underlying mutation and copy number data to create the figures was formatted usi
 
 	def meltBet(path):
 	    data_xls = pd.read_excel(path, index_col=None)
-
-		data_xls = pd.melt(data_xls, id_vars=['CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'NOTES'])
-		data_xls.rename(columns={'value': 'Allele_frequency'}, inplace=True)
-		data_xls.rename(columns={'variable': 'Patient_ID'}, inplace=True)
-
-		data_xls = data_xls[data_xls['Allele_frequency'].str.contains("*", regex=False)]
-
-		data_xls['Read_depth'] = data_xls['Allele_frequency'].str.split(':').str[1]
-		data_xls['Read_depth'] = data_xls['Read_depth'].apply(pd.to_numeric)
-		data_xls['Allele_frequency'] = pd.to_numeric(data_xls['Allele_frequency'].str.split(':').str[0]) / data_xls['Read_depth'] * 100
-		data_xls[['Read_depth','Allele_frequency']] = data_xls[['Read_depth','Allele_frequency']].apply(pd.to_numeric)
-
-		data_xls = data_xls[['Patient_ID', 'CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'Allele_frequency', 'Read_depth','NOTES']]
-		return data_xls;
+	    data_xls = pd.melt(data_xls, id_vars=['CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'NOTES'])
+	    data_xls.rename(columns={'value': 'Allele_frequency'}, inplace=True)
+	    data_xls.rename(columns={'variable': 'Patient_ID'}, inplace=True)
+	    data_xls = data_xls[data_xls['Allele_frequency'].str.contains("*", regex=False)]
+	    data_xls['Read_depth'] = data_xls['Allele_frequency'].str.split(':').str[1]
+	    data_xls['Read_depth'] = data_xls['Read_depth'].apply(pd.to_numeric)
+	    data_xls['Allele_frequency'] = pd.to_numeric(data_xls['Allele_frequency'].str.split(':').str[0]) / data_xls['Read_depth'] * 100
+	    data_xls[['Read_depth','Allele_frequency']] = data_xls[['Read_depth','Allele_frequency']].apply(pd.to_numeric)
+	    data_xls = data_xls[['Patient_ID', 'CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'Allele_frequency', 'Read_depth','NOTES']]
+	    return data_xls
 
 
 Other recurrent Python code:
