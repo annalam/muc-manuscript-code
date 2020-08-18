@@ -3,6 +3,8 @@ Python ReadMe
 All figures were generated in Python 3.7.3 using the packages and libraries listed below. All statistics were performed with the scipy.stats package, except for 
 Cox Proportional-Hazard Models, which were performed with lifelines.
 
+Included is a script to walk through our process to calculate tumor content for a single sample. 
+
 Our Anaconda environment can be recreated by running the following for each package:
 conda install PACKAGE=VERSION
 
